@@ -17,7 +17,8 @@ Usage:
 
 TODO: THINGS TO FIX:
 1. The caching needs to work on the real dataset, not just the test image (use this dataset: https://github.com/google-deepmind/open_x_embodiment)
-2. Need to modify the script to work with https://huggingface.co/datasets/openvla/modified_libero_rlds
+2. Need to modify the script to work with https://huggingface.co/datasets/openvla/modified_libero_rlds (Marc's was just unable to load the dataset from HF)
+3. Need caching of redid stream of all layers (including Layer 0 Pre so just embedding) at all positions throughout an episode
 """
 
 import argparse
