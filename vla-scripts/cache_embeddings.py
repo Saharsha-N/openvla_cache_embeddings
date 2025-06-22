@@ -14,6 +14,10 @@ Usage:
         --layers 0 6 11 23 \
         --positions -1 \
         --format pt
+
+TODO: THINGS TO FIX:
+1. The caching needs to work on the real dataset, not just the test image (use this dataset: https://github.com/google-deepmind/open_x_embodiment)
+2. Need to modify the script to work with https://huggingface.co/datasets/openvla/modified_libero_rlds
 """
 
 import argparse
