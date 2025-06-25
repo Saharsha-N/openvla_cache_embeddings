@@ -1,4 +1,10 @@
+apache-beam
+dm-tree
+draccus
+protobuf
+tensorflow
 timm==0.9.10
+tfds-nightly
 tokenizers==0.19.1
 torch>=2.2.0
 torchvision>=0.16.0
