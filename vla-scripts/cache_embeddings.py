@@ -62,6 +62,7 @@ from tqdm import tqdm
 # Import tensorflow_datasets
 import tensorflow_datasets as tfds
 import tensorflow as tf # Required by tfds for some operations
+import traceback # For more detailed error printing
 
 # Disable GPU for TF if PyTorch is using it, to avoid conflicts
 tf.config.set_visible_devices([], 'GPU')
@@ -144,10 +145,15 @@ class EmbeddingExtractor:
         print(f"[LEGITIMATE MODE] Analyzing model structure...")
         if hasattr(self.model, 'language_model'):
             self.language_model = self.model.language_model
-        elif hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
-             self.language_model = self.model
+        elif hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'): # e.g. some LLMs store layers under model.model
+             self.language_model = self.model # language_model component might be the model itself if layers are nested deeper
+             print(f"[LEGITIMATE MODE] Using model itself as language_model base for layers: {type(self.language_model)}")
         else:
-            raise ValueError("[LEGITIMATE MODE] Could not find language_model attribute or compatible structure.")
+            # This case might indicate an unexpected model structure or that self.model itself is the language model
+            # For robustness, assume self.model might directly have 'layers' or 'embed_tokens' if 'language_model' is not found
+            self.language_model = self.model 
+            print(f"[LEGITIMATE MODE] 'language_model' attribute not found. Assuming model attributes are on: {type(self.language_model)}")
+
 
         if hasattr(self.language_model, 'model') and hasattr(self.language_model.model, 'layers'):
             self.transformer_layers = self.language_model.model.layers
@@ -187,13 +193,13 @@ class EmbeddingExtractor:
         for idx in layer_indices:
             actual_idx = self.num_layers + idx if idx < 0 else idx
             if 0 <= actual_idx < self.num_layers: valid_hooks.append(actual_idx)
-            else: print(f"[LEGITIMATE MODE] Warning: Layer index {idx} out of range. Skipping.")
-        return valid_hooks
+            else: print(f"[LEGITIMATE MODE] Warning: Layer index {idx} (resolved: {actual_idx}) out of range [0, {self.num_layers-1}]. Skipping.")
+        return sorted(list(set(valid_hooks))) # Ensure unique and sorted
 
     def register_hooks(self, layer_indices: Optional[List[int]] = None):
         self.clear_hooks()
         layers_to_hook = self._get_layers_to_hook(layer_indices)
-        print(f"[LEGITIMATE MODE] Registering hooks on layers: {layers_to_hook or 'all'}")
+        print(f"[LEGITIMATE MODE] Registering hooks on layers: {layers_to_hook or 'all applicable'}") # Changed 'all' to 'all applicable'
         print(f"[LEGITIMATE MODE] Caching streams: {self.residual_stream_types}, Layer0: {self.include_layer0_embedding}")
 
         self.total_layers_to_process = 0
@@ -206,9 +212,14 @@ class EmbeddingExtractor:
             self.hooks.append(self.embedding_layer.register_forward_hook(self._create_output_hook("L0_embedding", "embedding_output")))
 
         for layer_idx in layers_to_hook:
-            module = self.transformer_layers[layer_idx]
-            if "input" in self.residual_stream_types: self.hooks.append(module.register_forward_pre_hook(self._create_input_hook(layer_idx, "residual_input")))
-            if "output" in self.residual_stream_types: self.hooks.append(module.register_forward_hook(self._create_output_hook(layer_idx, "residual_output")))
+            # Additional check for safety, though _get_layers_to_hook should prevent out-of-bounds
+            if 0 <= layer_idx < len(self.transformer_layers):
+                module = self.transformer_layers[layer_idx]
+                if "input" in self.residual_stream_types: self.hooks.append(module.register_forward_pre_hook(self._create_input_hook(layer_idx, "residual_input")))
+                if "output" in self.residual_stream_types: self.hooks.append(module.register_forward_hook(self._create_output_hook(layer_idx, "residual_output")))
+            else:
+                print(f"[LEGITIMATE MODE] Warning: Skipped registering hook for invalid layer index {layer_idx} during loop.")
+
         print(f"[LEGITIMATE MODE] Registered {len(self.hooks)} hooks. Expecting {self.total_layers_to_process} output hook calls.")
 
     def clear_hooks(self):
@@ -225,7 +236,7 @@ class EmbeddingExtractor:
 
         self.progress_bar = tqdm(total=self.total_layers_to_process, desc="Extracting step (real)", unit="layer", leave=False, bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
         try:
-            with torch.no_grad(): _ = self.model(**inputs, output_hidden_states=False)
+            with torch.no_grad(): _ = self.model(**inputs, output_hidden_states=False) # output_hidden_states=False is often default. Hooks grab intermediates.
         finally:
             if self.progress_bar:
                 if self.layers_processed < self.total_layers_to_process: self.progress_bar.update(self.total_layers_to_process - self.layers_processed)
@@ -234,9 +245,13 @@ class EmbeddingExtractor:
         final_embeddings = {}
         for key, full_emb in self.extracted_embeddings.items():
             seq_emb = full_emb.squeeze(0) if full_emb.ndim == 3 and full_emb.shape[0] == 1 else full_emb
+            if seq_emb.ndim != 2: # Expect (seq_len, hidden_dim)
+                print(f"[LEGITIMATE MODE] Warning: Embedding for {key} has unexpected shape {seq_emb.shape}. Skipping.")
+                continue
             if token_positions == "all": final_embeddings[key] = seq_emb
             else:
-                indices = [seq_emb.shape[0] + p if p < 0 else p for p in token_positions if 0 <= (seq_emb.shape[0] + p if p < 0 else p) < seq_emb.shape[0]]
+                current_seq_len = seq_emb.shape[0]
+                indices = [current_seq_len + p if p < 0 else p for p in token_positions if 0 <= (current_seq_len + p if p < 0 else p) < current_seq_len]
                 if indices: final_embeddings[key] = seq_emb[indices]
         return final_embeddings.copy()
 
@@ -247,35 +262,33 @@ class MockEmbeddingExtractor:
     Simulates the embedding extraction process for testing script logic quickly.
     Does not load any real models or perform actual computations.
     """
-    def __init__(self, model_path: str, residual_stream_types: Optional[List[str]] = None, include_layer0_embedding: bool = False, **kwargs):
+    def __init__(self, model_path: str, residual_stream_types: Optional[List[str]] = None, include_layer0_embedding: bool = False, device: Optional[str]=None, torch_dtype: Optional[torch.dtype]=None, use_flash_attention: Optional[bool]=None, **kwargs): # Matched args with Real Extractor
         print(f"[MOCK MODE] Initializing MockEmbeddingExtractor for model_path: '{model_path}'")
         self.model_path = model_path
-        self.device = "cpu"  # Mock device
-        self.num_layers = 12  # Mock number of layers, adjust if needed for parse_layer_indices
-        self.processor = "mock_processor_object" # Placeholder for processor attribute
+        self.device = "cpu"
+        self.num_layers = 12 # Default mock layers, can be adjusted if needed for testing parse_layer_indices
+        self.processor = "mock_processor_object"
         self.residual_stream_types = residual_stream_types or ["output"]
         self.include_layer0_embedding = include_layer0_embedding
         
-        self.total_layers_to_process = 0 # Calculated in register_hooks
-        self.progress_bar = None # Mock progress bar handling
-        self.layers_processed = 0 # Mock progress bar handling
-        _ = kwargs # Absorb other arguments
+        self.total_layers_to_process = 0
+        self.progress_bar = None
+        self.layers_processed = 0
+        _ = kwargs
 
     def register_hooks(self, layer_indices: Optional[List[int]] = None):
-        """Simulates registering hooks."""
-        # Determine actual layers to "hook" based on input
         if layer_indices is None:
             layers_to_hook_indices = list(range(self.num_layers))
         else:
             layers_to_hook_indices = []
-            for idx in layer_indices:
+            for idx in layer_indices: # Simplified _get_layers_to_hook logic for mock
                 actual_idx = self.num_layers + idx if idx < 0 else idx
                 if 0 <= actual_idx < self.num_layers:
                     layers_to_hook_indices.append(actual_idx)
+        layers_to_hook_indices = sorted(list(set(layers_to_hook_indices))) # Ensure unique & sorted for mock consistency
         
-        print(f"[MOCK MODE] Simulating registering hooks for layers: {layers_to_hook_indices or 'all'}")
+        print(f"[MOCK MODE] Simulating registering hooks for layers: {layers_to_hook_indices or 'all (based on num_layers)'}")
         
-        # Calculate total_layers_to_process for mock progress bar
         self.total_layers_to_process = 0
         if "output" in self.residual_stream_types:
             self.total_layers_to_process += len(layers_to_hook_indices)
@@ -286,7 +299,6 @@ class MockEmbeddingExtractor:
 
 
     def clear_hooks(self):
-        """Simulates clearing hooks."""
         print("[MOCK MODE] Simulating clearing hooks.")
         if self.progress_bar: self.progress_bar.close(); self.progress_bar = None
 
@@ -297,53 +309,43 @@ class MockEmbeddingExtractor:
         prompt: str,
         token_positions: Union[List[int], str] = "all",
     ) -> Dict[Tuple[Union[int, str], str], torch.Tensor]:
-        """Simulates extracting embeddings."""
         print(f"[MOCK MODE] Simulating extraction for image size: {image_pil.size}, prompt: '{prompt[:30]}...'")
         
-        # Simulate progress bar
         self.layers_processed = 0
         self.progress_bar = tqdm(total=self.total_layers_to_process, desc="Extracting step (mock)", unit="layer", leave=False, bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
         
-        # Simulate some work and progress updates
         for _ in range(self.total_layers_to_process):
-            time.sleep(0.001) # Tiny sleep
+            time.sleep(0.001)
             self.layers_processed +=1
             self.progress_bar.update(1)
         if self.progress_bar: self.progress_bar.close(); self.progress_bar = None
 
-
         mock_results = {}
-        hidden_dim = 768  # Standard mock hidden dimension
-        mock_seq_len = 25  # Mock sequence length
+        hidden_dim = 768
+        mock_seq_len = 25
 
-        # Generate mock data for the layers/streams it expects based on total_layers_to_process
-        # This is a simplification; real hooks are more specific.
-        # Let's assume 'output' stream for all processed layers.
+        # This mock generation is simplified. A more advanced one would use the
+        # actual layer_indices passed to register_hooks if they were stored.
+        num_outputs_to_generate = self.total_layers_to_process
         
-        num_mock_transformer_layers = self.total_layers_to_process
         if self.include_layer0_embedding and ("output" in self.residual_stream_types or not self.residual_stream_types):
-            mock_results[("L0_embedding", "embedding_output")] = torch.randn(mock_seq_len, hidden_dim)
-            num_mock_transformer_layers -=1
+            if num_outputs_to_generate > 0:
+                mock_results[("L0_embedding", "embedding_output")] = torch.randn(mock_seq_len, hidden_dim)
+                num_outputs_to_generate -=1
 
-
-        for i in range(max(0, num_mock_transformer_layers)): # Iterate for remaining expected outputs
-            # Use a dummy layer index; doesn't have to match precisely for mock,
-            # just needs to generate the right number of entries.
-            # A more robust mock would use the parsed layer_indices.
-            layer_id = i 
+        for i in range(num_outputs_to_generate):
+            # This 'i' is just a counter, not necessarily the true layer index
             if "output" in self.residual_stream_types:
-                mock_results[(layer_id, "residual_output")] = torch.randn(mock_seq_len, hidden_dim)
-            if "input" in self.residual_stream_types: # Though input hooks don't update progress in real one
-                 mock_results[(layer_id, "residual_input")] = torch.randn(mock_seq_len, hidden_dim)
-
-
-        # Simulate token selection
+                mock_results[(i, "residual_output")] = torch.randn(mock_seq_len, hidden_dim)
+            # Input streams are not counted in total_layers_to_process for mock progress
+            # if "input" in self.residual_stream_types:
+            #      mock_results[(i, "residual_input")] = torch.randn(mock_seq_len, hidden_dim)
+        
         final_embeddings = {}
         for key, full_seq_embedding in mock_results.items():
             if token_positions == "all":
                 final_embeddings[key] = full_seq_embedding
             else:
-                # Mock selection logic (e.g., specific indices or last token)
                 selected_indices = []
                 for pos in token_positions:
                     actual_pos = mock_seq_len + pos if pos < 0 else pos
@@ -351,8 +353,6 @@ class MockEmbeddingExtractor:
                         selected_indices.append(actual_pos)
                 if selected_indices:
                     final_embeddings[key] = full_seq_embedding[selected_indices]
-                # else:
-                #     print(f"[MOCK MODE] No valid tokens for {key} with positions {token_positions}")
         
         return final_embeddings.copy()
 
@@ -360,34 +360,38 @@ class MockEmbeddingExtractor:
 def save_embeddings(
     embeddings: Dict[Tuple[Union[int, str], str], torch.Tensor],
     output_dir: Path,
-    format: str = "pt",
+    format_str: str, # Renamed from 'format' to avoid conflict with built-in
     metadata: Optional[Dict] = None,
 ):
     output_dir.mkdir(parents=True, exist_ok=True)
-    # print(f"[*] Saving {len(embeddings)} embedding tensors to: {output_dir}") # Can be verbose in loops
 
     for key_tuple, embedding in embeddings.items():
         layer_id, stream_name = key_tuple
         safe_layer_id = str(layer_id).replace("/", "_") 
         filename_base = f"layer_{safe_layer_id}_{stream_name}"
 
-        if format == "pt":
+        if format_str == "pt":
             file_path = output_dir / f"{filename_base}.pt"
             torch.save(embedding, file_path)
-        elif format == "npy":
+        elif format_str == "npy":
             file_path = output_dir / f"{filename_base}.npy"
             np.save(file_path, embedding.cpu().numpy())
         else:
-            raise ValueError(f"Unsupported format: {format}")
+            raise ValueError(f"Unsupported format: {format_str}")
 
     if metadata:
         metadata_path = output_dir / "step_metadata.json"
         with open(metadata_path, "w") as f:
+            # Sanitize metadata for JSON (embedding_shapes keys)
             if "embedding_shapes" in metadata:
-                metadata["embedding_shapes"] = {
-                    f"layer_{str(k_tuple[0]).replace('/', '_')}_{k_tuple[1]}": list(v_shape)
-                    for k_tuple, v_shape in metadata["embedding_shapes"].items()
-                }
+                sanitized_shapes = {}
+                # metadata["embedding_shapes"] is Dict[Tuple, List]
+                # JSON keys must be strings.
+                for k_tuple_meta, v_shape_list_meta in metadata["embedding_shapes"].items():
+                    # k_tuple_meta is (layer_id, stream_name)
+                    str_key_meta = f"L_{str(k_tuple_meta[0]).replace('/', '_')}_{k_tuple_meta[1]}"
+                    sanitized_shapes[str_key_meta] = list(v_shape_list_meta) 
+                metadata["embedding_shapes"] = sanitized_shapes
             json.dump(metadata, f, indent=2)
 
 
@@ -411,12 +415,15 @@ def visualize_embeddings(
         
         if len(all_embeddings_list) >= 2:
             stacked_embeddings = np.array(all_embeddings_list)
-            if stacked_embeddings.ndim == 1: stacked_embeddings = np.vstack(all_embeddings_list) # if all were 1D
-            if stacked_embeddings.shape[0] < 2: return
+            if stacked_embeddings.ndim == 1: # Should not happen if len(data) >= 2
+                if len(all_embeddings_list) >=2 : stacked_embeddings = np.vstack(all_embeddings_list)
+                else: return # Not enough data points
+            
+            if stacked_embeddings.shape[0] < 2: return # Need at least 2 samples for PCA
 
             try:
-                n_comp = min(2, stacked_embeddings.shape[1], stacked_embeddings.shape[0])
-                if n_comp < 2: return
+                n_comp = min(2, stacked_embeddings.shape[1], stacked_embeddings.shape[0]) # n_components <= min(n_samples, n_features)
+                if n_comp < 2: return # Cannot make a 2D plot
                 
                 pca = PCA(n_components=n_comp)
                 reduced = pca.fit_transform(stacked_embeddings)
@@ -424,33 +431,46 @@ def visualize_embeddings(
                 plt.scatter(reduced[:, 0], reduced[:, 1])
                 for i, lbl in enumerate(labels): plt.annotate(lbl, (reduced[i, 0], reduced[i, 1]))
                 
-                pc1_var = pca.explained_variance_ratio_[0] if len(pca.explained_variance_ratio_) > 0 else 0
-                pc2_var = pca.explained_variance_ratio_[1] if len(pca.explained_variance_ratio_) > 1 else 0
+                pc1_var = pca.explained_variance_ratio_[0] if n_comp > 0 and len(pca.explained_variance_ratio_)>0 else 0
+                pc2_var = pca.explained_variance_ratio_[1] if n_comp > 1 and len(pca.explained_variance_ratio_)>1 else 0
                 plt.xlabel(f"PC1 ({pc1_var:.2%})"); plt.ylabel(f"PC2 ({pc2_var:.2%})")
                 plt.title(f"PCA (Step in {output_dir.name})"); plt.grid(True, alpha=0.3)
                 plt.savefig(output_dir / "pca_step_visualization.png", dpi=300, bbox_inches="tight")
                 plt.close()
-            except ValueError as e:
-                print(f"[*] PCA Error for {output_dir.name}: {e}. Data shape: {stacked_embeddings.shape}. Skipping.")
+            except ValueError as e: # Catch errors like n_components > n_features or n_samples
+                print(f"[*] PCA Error for {output_dir.name}: {e}. Data shape: {stacked_embeddings.shape}. Skipping visualization.")
+            except Exception as e_pca: # Catch other unexpected PCA errors
+                 print(f"[*] Unexpected PCA Error for {output_dir.name}: {e_pca}. Skipping visualization.")
 
 
 def format_prompt_from_instruction(instruction: str, model_path_or_name: str) -> str:
-    if instruction.strip().startswith("In:") and "\nOut:" in instruction: return instruction
-    return f"In: What action should the robot take to {instruction.lower()}?\nOut:"
+    instr_strip = instruction.strip()
+    if instr_strip.startswith("In:") and "\nOut:" in instr_strip: return instruction # Avoid double-prompting
+    return f"In: What action should the robot take to {instr_strip.lower()}?\nOut:" # Standard OpenVLA format
 
 
 def parse_layer_indices(layer_str: str, num_layers: int) -> List[int]:
+    if num_layers == 0: return [] # No layers to parse if model has no layers
     if layer_str.lower() == "all": return list(range(num_layers))
+    global indices
     indices = set()
     for part in layer_str.split(","):
         part = part.strip()
         try:
             if "-" in part and not part.startswith("-"):
                 start, end = map(int, part.split("-"))
-                indices.update(range(start, end + 1))
-            else: indices.add(int(part))
-        except ValueError: print(f"Warning: Invalid layer spec '{part}'. Skipping.")
-    return sorted(list(indices))
+                # Handle negative indices in ranges correctly relative to num_layers
+                actual_start = num_layers + start if start < 0 else start
+                actual_end = num_layers + end if end < 0 else end
+                if actual_start > actual_end: # Support ranges like -1 - -5 (last 5 layers)
+                    actual_start, actual_end = actual_end, actual_start
+                indices.update(range(actual_start, actual_end + 1))
+            else: 
+                indices.add(int(part))
+        except ValueError: print(f"Warning: Invalid layer specification '{part}'. Skipping.")
+    # Filter for valid indices (including negative) and sort
+    return sorted([idx for idx in list(indices) if -num_layers <= idx < num_layers])
+
 
 def parse_token_positions(pos_str: str) -> Union[List[int], str]:
     if pos_str.lower() == "all": return "all"
@@ -460,9 +480,14 @@ def parse_token_positions(pos_str: str) -> Union[List[int], str]:
         try:
             if "-" in part and not part.startswith("-"):
                 start, end = map(int, part.split("-"))
-                positions.update(range(start, end + 1))
-            else: positions.add(int(part))
-        except ValueError: print(f"Warning: Invalid token position spec '{part}'. Skipping.")
+                # Token positions don't usually use num_tokens for negative indexing range start/end yet
+                # as seq_len is dynamic. Negative indices are resolved per-sequence.
+                # Here, we just store the range as is.
+                indices.update(range(start, end + 1))
+
+            else: 
+                positions.add(int(part))
+        except ValueError: print(f"Warning: Invalid token position specification '{part}'. Skipping.")
     return sorted(list(positions))
 
 
@@ -506,7 +531,7 @@ HOW TO RUN EXAMPLES:
     parser.add_argument("--output_dir", type=str, required=True, help="Base output directory for cached embeddings")
     parser.add_argument("--layers", type=str, default="all", help="Layer indices (e.g., '0,6,11,23', '0-5', 'all')")
     parser.add_argument("--positions", type=str, default="-1", help="Token positions (e.g., '-1', '0,1,-1', 'all')")
-    parser.add_argument("--format", type=str, choices=["pt", "npy"], default="pt", help="Output format for embeddings")
+    parser.add_argument("--format", type=str, choices=["pt", "npy"], default="pt", help="Output format for embeddings") # Changed arg name
     parser.add_argument("--device", type=str, default=None, help="Device ('cuda', 'cpu'). Auto-detects if None.")
     parser.add_argument("--dtype", type=str, choices=["float32", "float16", "bfloat16"], default="bfloat16", help="Model dtype")
     parser.add_argument("--no_flash_attention", action="store_true", help="Disable flash attention")
@@ -515,7 +540,7 @@ HOW TO RUN EXAMPLES:
     parser.add_argument("--visualize", action="store_true", help="Create PCA visualization for each step")
 
     # Dataset parameters
-    parser.add_argument("--dataset_name", type=str, required=True, help="TFDS dataset name (e.g., 'openvla/modified_libero_rlds') or GCS path (gs://...)")
+    parser.add_argument("--dataset_name", type=str, required=True, help="TFDS dataset name (e.g., 'openvla/modified_libero_rlds') or GCS path (gs://...) or local dir path")
     parser.add_argument("--dataset_split", type=str, default="train", help="Dataset split (e.g., 'train', 'validation', 'train[:1%%]')")
     parser.add_argument("--tfds_data_dir", type=str, default=None, help="TFDS download/storage directory (optional)")
     parser.add_argument("--num_episodes", type=int, default=1, help="Number of episodes to process")
@@ -541,15 +566,13 @@ HOW TO RUN EXAMPLES:
     try:
         # Conditional instantiation of the extractor based on --test_mode
         if args.test_mode:
-            # In test_mode, some real model args are passed but mostly ignored by MockExtractor
             extractor = MockEmbeddingExtractor(
                 model_path=args.model_path,
                 residual_stream_types=args.residual_stream_types,
                 include_layer0_embedding=args.include_layer0_embedding,
-                # Other args like device, dtype, flash_attention are not used by mock
+                # device, torch_dtype, use_flash_attention are implicitly defaults or unused by mock
             )
         else:
-            # Real mode
             extractor = EmbeddingExtractor(
                 model_path=args.model_path,
                 residual_stream_types=args.residual_stream_types,
@@ -560,27 +583,22 @@ HOW TO RUN EXAMPLES:
             )
 
         # Common setup for both modes
-        if args.layers.lower() == "all":
-            layer_indices_to_hook = None 
-        else:
-            layer_indices_to_hook = parse_layer_indices(args.layers, extractor.num_layers)
+        # Ensure extractor.num_layers is available. For mock, it's set in __init__.
+        layer_indices_to_hook = parse_layer_indices(args.layers, extractor.num_layers) if extractor.num_layers > 0 else []
         
         token_positions_to_extract = parse_token_positions(args.positions)
-        extractor.register_hooks(layer_indices=layer_indices_to_hook) # Mock or Real register_hooks called
-        # print(f"[*] Hooks registered for layers: {layer_indices_to_hook if layer_indices_to_hook is not None else 'all available'}")
-        # print(f"[*] Will extract from token positions: {token_positions_to_extract}")
+        
+        # Pass None to register_hooks if "all" layers are requested, otherwise the parsed list.
+        # The _get_layers_to_hook method in extractors will handle None as "all layers".
+        hooks_arg = None if args.layers.lower() == "all" else layer_indices_to_hook
+        extractor.register_hooks(layer_indices=hooks_arg)
 
-        print(f"[*] Loading dataset: {args.dataset_name}, split: {args.dataset_split}")
-        # Dataset loading logic (mock or real)
-        # In test_mode, TFDS can use mock data if the dataset_name is recognized by tfds.testing.mock_data
-        # or if you implement a specific mock data generator. For simplicity, we'll let it try.
-        # If dataset loading fails in test_mode, it's often okay as the core logic is what's tested.
-        # However, for robust mock testing of dataset iteration, a tfds.testing.mock_data setup is best.
-        # For this script, the mock extractor bypasses needing real data from the dataset iterator.
+        # --- Dataset Loading ---
+        print(f"[*] Preparing dataset: {args.dataset_name}, split: {args.dataset_split}")
         ds = None
         if args.test_mode:
-            print("[MOCK MODE] Skipping real dataset loading. Will use mock iteration.")
-            # Create a mock iterable for episodes and steps
+            print("[MOCK MODE] Using mock dataset generator.")
+            # Mock dataset generator from your provided script
             def mock_dataset_generator(num_episodes, max_steps):
                 for i in range(num_episodes):
                     mock_episode_id = f"mock_ep_{i:03d}"
@@ -588,170 +606,286 @@ HOW TO RUN EXAMPLES:
                     num_mock_steps = max_steps if max_steps is not None else np.random.randint(5,15)
                     for j in range(num_mock_steps):
                         mock_step = {
-                            # Populate with minimal data mock extractor might look for, if any.
-                            # For our current mock, it doesn't really use the step_data content.
-                            'observation': {'image': tf.zeros((64,64,3), dtype=tf.uint8)}, # Mock image tensor
+                            'observation': {'image': tf.zeros((64,64,3), dtype=tf.uint8)},
                             'action': {'mock_action': tf.zeros((7,), dtype=tf.float32)}
                         }
-                        # If instruction_key is not episode_metadata, mock it here
                         if not args.instruction_key.startswith("episode_metadata"):
                              nested_keys = args.instruction_key.split('.')
                              current_dict = mock_step
                              for k_idx, k_part in enumerate(nested_keys[:-1]):
-                                 current_dict.setdefault(k_part, {})
-                                 current_dict = current_dict[k_part]
-                             current_dict[nested_keys[-1]] = tf.constant(f"Mock step instruction {j}")
-
-
+                                 current_dict = current_dict.setdefault(k_part, {}) # Use setdefault
+                             current_dict[nested_keys[-1]] = tf.constant(f"Mock step instruction {j}", dtype=tf.string) # Ensure dtype
                         mock_steps_data.append(mock_step)
                     
-                    mock_episode = {'episode_id': tf.constant(mock_episode_id), 'steps': tf.data.Dataset.from_generator(lambda: (s for s in mock_steps_data), output_signature={k: tf.TensorSpec.from_tensor(v) if isinstance(v,tf.Tensor) else {sk: tf.TensorSpec.from_tensor(sv) for sk,sv in v.items()} for k,v in mock_steps_data[0].items()})}
+                    # Create step dataset signature from first mock step
+                    first_step_sig = {}
+                    if mock_steps_data: # Ensure there's at least one step to get signature
+                        for k,v_top in mock_steps_data[0].items():
+                            if isinstance(v_top, dict):
+                                first_step_sig[k] = {ik: tf.TensorSpec.from_tensor(iv) for ik, iv in v_top.items()}
+                            elif isinstance(v_top, tf.Tensor):
+                                 first_step_sig[k] = tf.TensorSpec.from_tensor(v_top)
+                            # Add other type handling if necessary
+                    else: # Fallback signature if no steps
+                         first_step_sig = {'observation': {'image': tf.TensorSpec(shape=(64,64,3),dtype=tf.uint8)}, 'action':{'mock_action':tf.TensorSpec(shape=(7,),dtype=tf.float32)}}
+
+
+                    episode_entry = {'episode_id': tf.constant(mock_episode_id, dtype=tf.string), # Ensure dtype
+                                     'steps': tf.data.Dataset.from_generator(lambda: (s for s in mock_steps_data), output_signature=first_step_sig)}
                     
                     # Mock episode_metadata for instruction key
+                    # This part needs to be careful to match the expected signature
+                    ep_meta_data_mock = {}
                     if args.instruction_key.startswith("episode_metadata"):
-                        metadata_keys = args.instruction_key.split('.') # e.g. episode_metadata.natural_language_instruction
-                        current_meta_dict = mock_episode
-                        # current_meta_dict.setdefault(metadata_keys[0], {}) # episode_metadata
-                        # current_meta_dict = current_meta_dict[metadata_keys[0]]
-                        # for k_idx, k_part in enumerate(metadata_keys[1:-1]):
-                        #      current_meta_dict.setdefault(k_part, {})
-                        #      current_meta_dict = current_meta_dict[k_part]
-                        # current_meta_dict[metadata_keys[-1]] = tf.constant(f"Mock episode instruction for {mock_episode_id}")
-                        # Simplified mocking for episode_metadata:
-                        mock_episode['episode_metadata'] = {'natural_language_instruction': tf.constant(f"Mock instruction for {mock_episode_id}")}
+                        meta_keys_mock = args.instruction_key.split('.') # e.g. episode_metadata.natural_language_instruction
+                        current_meta_dict_mock = ep_meta_data_mock
+                        # Skip 'episode_metadata' part if it's the first key, as we are building inside 'episode_metadata' key
+                        keys_to_nest_mock = meta_keys_mock[1:] if meta_keys_mock[0] == 'episode_metadata' else meta_keys_mock
+                        
+                        for k_idx_mock, k_part_mock in enumerate(keys_to_nest_mock[:-1]):
+                            current_meta_dict_mock = current_meta_dict_mock.setdefault(k_part_mock, {})
+                        current_meta_dict_mock[keys_to_nest_mock[-1]] = tf.constant(f"Mock episode instruction for {mock_episode_id}", dtype=tf.string) # Ensure dtype
+                    else: # Ensure a placeholder if instruction is not in episode_metadata
+                        ep_meta_data_mock['placeholder_meta'] = tf.constant("mock_placeholder", dtype=tf.string) # Ensure dtype
+
+                    episode_entry['episode_metadata'] = ep_meta_data_mock
+                    yield episode_entry
+
+            # Define output signature for the generator based on args.image_key and args.instruction_key
+            # This is complex due to nested keys.
+            _mock_img_sig = tf.TensorSpec(shape=(None,None,3), dtype=tf.uint8) # Flexible image size for mock
+            _mock_instr_sig = tf.TensorSpec(shape=(), dtype=tf.string)
+
+            step_sig_dict = {}
+            # Image key signature (handles nesting)
+            current_level_img = step_sig_dict
+            img_keys_list = args.image_key.split('.')
+            for k_part_img in img_keys_list[:-1]: current_level_img = current_level_img.setdefault(k_part_img, {})
+            current_level_img[img_keys_list[-1]] = _mock_img_sig
+            step_sig_dict.setdefault('action', {})['mock_action'] = tf.TensorSpec(shape=(None,),dtype=tf.float32)
+
+            # Step instruction key signature (if not in episode_metadata)
+            if not args.instruction_key.startswith("episode_metadata"):
+                current_level_instr_step = step_sig_dict
+                instr_keys_list_step = args.instruction_key.split('.')
+                for k_part_instr_step in instr_keys_list_step[:-1]: current_level_instr_step = current_level_instr_step.setdefault(k_part_instr_step, {})
+                current_level_instr_step[instr_keys_list_step[-1]] = _mock_instr_sig
+            
+            # Episode metadata signature
+            ep_meta_sig_dict_final = {}
+            if args.instruction_key.startswith("episode_metadata"):
+                meta_instr_key_actual = args.instruction_key.split('.', 1)[1] if '.' in args.instruction_key else args.instruction_key # key within episode_metadata
+                current_level_meta = ep_meta_sig_dict_final
+                meta_instr_keys_parts_actual = meta_instr_key_actual.split('.')
+                for k_part_meta in meta_instr_keys_parts_actual[:-1]: current_level_meta = current_level_meta.setdefault(k_part_meta, {})
+                current_level_meta[meta_instr_keys_parts_actual[-1]] = _mock_instr_sig
+            else: # Ensure a placeholder for episode_metadata if instruction is step-level
+                 ep_meta_sig_dict_final['placeholder_meta'] = tf.TensorSpec(shape=(), dtype=tf.string)
 
 
-                    yield mock_episode
-            ds = tf.data.Dataset.from_generator(lambda: mock_dataset_generator(args.num_episodes, args.max_steps_per_episode), 
-                                                output_signature={'episode_id': tf.TensorSpec(shape=(), dtype=tf.string), 
-                                                                  'steps': tf.data.DatasetSpec(tfds.features.FeaturesDict({'observation': {'image': tfds.features.Tensor(shape=(64,64,3), dtype=tf.uint8)}, 'action':{'mock_action': tfds.features.Tensor(shape=(7,), dtype=tf.float32)}}).get_tensor_spec()),
-                                                                  'episode_metadata': tfds.features.FeaturesDict({'natural_language_instruction': tfds.features.Tensor(shape=(), dtype=tf.string)}).get_tensor_spec()
-                                                                  }
-                                                )
-        else: # Legitimate mode - load real dataset
-            try:
-                if "/" in args.dataset_name and not args.dataset_name.startswith("gs://"):
-                     dataset_builder = tfds.builder(args.dataset_name, data_dir=args.tfds_data_dir)
-                     dataset_builder.download_and_prepare()
-                     ds_full = dataset_builder.as_dataset(split=f"{args.dataset_split}")
-                else:
-                     dataset_builder = tfds.builder_from_directory(builder_dir=args.dataset_name)
-                     ds_full = dataset_builder.as_dataset(split=f"{args.dataset_split}")
-                ds = ds_full.take(args.num_episodes)
-            except Exception as e:
-                print(f"Error loading dataset '{args.dataset_name}': {e}")
+            episode_final_sig = {'episode_id': tf.TensorSpec(shape=(),dtype=tf.string), 
+                                 'steps': tf.data.DatasetSpec(step_sig_dict),
+                                 'episode_metadata': ep_meta_sig_dict_final}
+            
+            ds = tf.data.Dataset.from_generator(lambda: mock_dataset_generator(args.num_episodes, args.max_steps_per_episode), output_signature=episode_final_sig)
+        
+        # ========== START OF MODIFIED LEGITIMATE MODE DATASET LOADING ==========
+        else: # LEGITIMATE MODE - Actual dataset loading
+            dataset_specifier = args.dataset_name
+            builder = None
+            print(f"[LEGITIMATE MODE] Attempting to load: '{dataset_specifier}'")
+            
+            load_from_hf_or_registered = False # Flag to call download_and_prepare
+
+            if dataset_specifier.startswith("gs://"):
+                print(f"[*] Detected GCS path. Using tfds.builder_from_directory.")
+                try:
+                    builder = tfds.builder_from_directory(builder_dir=dataset_specifier)
+                except Exception as e_gcs:
+                    print(f"Error with tfds.builder_from_directory for GCS path '{dataset_specifier}': {e_gcs}")
+                    print("Ensure the GCS path is correct and accessible (e.g., gsutil auth login might be needed).")
+                    sys.exit(1)
+            elif os.path.isdir(dataset_specifier): # Check if it's an existing local directory
+                print(f"[*] Detected local directory path. Using tfds.builder_from_directory.")
+                try:
+                    builder = tfds.builder_from_directory(builder_dir=dataset_specifier)
+                except Exception as e_local:
+                    print(f"Error with tfds.builder_from_directory for local path '{dataset_specifier}': {e_local}")
+                    print("Ensure the path points to a valid TFDS dataset directory.")
+                    sys.exit(1)
+            else: # Assume it's a registered TFDS name (e.g., from HF Hub)
+                print(f"[*] Assuming registered TFDS name. Using tfds.builder with data_dir='{args.tfds_data_dir}'.")
+                try:
+                    builder = tfds.builder(dataset_specifier, data_dir=args.tfds_data_dir)
+                    load_from_hf_or_registered = True # Set flag to download and prepare
+                except tfds.core.DatasetNotFoundError:
+                    print(f"Error: Dataset '{dataset_specifier}' not found by tfds.builder().")
+                    print("If it's a GCS or local path, ensure it's correct. If it's a registered name, check spelling.")
+                    sys.exit(1)
+                except Exception as e_builder: # Catch other tfds.builder errors
+                    print(f"An unexpected error occurred with tfds.builder for '{dataset_specifier}': {e_builder}")
+                    sys.exit(1)
+            
+            if not builder: 
+                print("Error: Dataset builder could not be initialized. Please check dataset_name and paths.")
                 sys.exit(1)
+            
+            if load_from_hf_or_registered:
+                print(f"[*] Calling download_and_prepare() for '{dataset_specifier}'. This may take time...")
+                try:
+                    builder.download_and_prepare(download_dir=args.tfds_data_dir) # download_dir for tfds.builder
+                    print(f"[*] download_and_prepare() complete for '{dataset_specifier}'.")
+                except Exception as e_prepare:
+                    print(f"Error during download_and_prepare for '{dataset_specifier}': {e_prepare}")
+                    sys.exit(1)
+            
+            # Validate split and load
+            split_to_load = args.dataset_split
+            main_split_name = split_to_load.split('[')[0] # e.g., 'train' from 'train[:10%]'
+            if main_split_name not in builder.info.splits:
+                print(f"Error: Split '{main_split_name}' not found in dataset '{args.dataset_name}'. Available splits: {list(builder.info.splits.keys())}")
+                sys.exit(1)
+            
+            print(f"[*] Loading split '{split_to_load}' from dataset.")
+            ds_full = builder.as_dataset(split=split_to_load) # TFDS handles slicing like "train[:10%]"
+            ds = ds_full.take(args.num_episodes) # Then take N episodes from that potentially sliced split
+        # ========== END OF MODIFIED LEGITIMATE MODE DATASET LOADING ==========
 
+
+        # --- Episode and Step Processing Loop ---
         total_steps_processed = 0
-        # Determine total for episode pbar (can be tricky if ds.take is used on infinite dataset)
-        # For mock, num_episodes is known. For real, if ds.take was used, it's also num_episodes.
-        episode_pbar_total = args.num_episodes
+        # For tqdm, if num_episodes is used with ds.take, total is args.num_episodes
+        # If ds.take fails (e.g. on empty dataset), this might be problematic.
+        # Fallback for total if ds is empty or cardinality is hard to get before iteration.
+        pbar_total_episodes = args.num_episodes
+        try:
+            # Attempt to get cardinality if possible, but be careful as it can be costly for some datasets
+            # For `ds.take(N)`, cardinality should be N if underlying dataset has at least N items.
+            # However, if underlying dataset is smaller, it'll be that smaller number.
+            # Using args.num_episodes as total for pbar is generally safe with ds.take().
+            pass
+        except Exception:
+            pass # Keep args.num_episodes
 
-        episode_pbar = tqdm(ds, total=episode_pbar_total, desc="Processing Episodes")
-
-        for i, episode_data in enumerate(episode_pbar):
+        episode_pbar = tqdm(ds, total=pbar_total_episodes, desc="Episodes")
+        
+        processed_ep_count = 0
+        for ep_idx, episode_data in enumerate(episode_pbar):
+            processed_ep_count +=1
             try:
-                episode_id_tensor = episode_data.get('episode_id', tf.constant(f"ep_{i:04d}", dtype=tf.string))
-                episode_id = episode_id_tensor.numpy().decode('utf-8') if isinstance(episode_id_tensor, tf.Tensor) and episode_id_tensor.dtype == tf.string else str(episode_id_tensor)
-                
-                episode_pbar.set_description(f"Episode {episode_id}")
-                episode_output_dir = Path(args.output_dir) / episode_id
-                episode_output_dir.mkdir(parents=True, exist_ok=True)
+                # Safely get episode_id (robust for different TFDS versions/structures)
+                ep_id_val = episode_data.get('episode_id') # Use .get for safety
+                if isinstance(ep_id_val, tf.Tensor):
+                    ep_id = ep_id_val.numpy().decode('utf-8') if ep_id_val.dtype == tf.string else str(ep_id_val.numpy())
+                elif isinstance(ep_id_val, (str, bytes)):
+                    ep_id = ep_id_val.decode('utf-8') if isinstance(ep_id_val, bytes) else str(ep_id_val)
+                else: # Fallback if 'episode_id' is missing or not a tensor/str/bytes
+                    ep_id = f"ep{ep_idx:03d}" # Use loop index as fallback
 
-                current_instruction = "No instruction"
-                instr_keys = args.instruction_key.split('.')
-                source = episode_data
-                valid_path = True
-                for key_part in instr_keys:
-                    if isinstance(source, dict) and key_part in source: source = source[key_part]
-                    elif hasattr(source, key_part): source = getattr(source, key_part)
-                    else: valid_path = False; break
-                if valid_path and source is not None:
-                    if isinstance(source, tf.Tensor) and source.dtype == tf.string:
-                        current_instruction = source.numpy().decode('utf-8') if source.shape.rank == 0 else (source.numpy()[0].decode('utf-8') if source.shape.rank > 0 and source.shape[0]>0 else "Empty instruction array")
-                    elif isinstance(source, (str, bytes)): current_instruction = source.decode('utf-8') if isinstance(source, bytes) else source
-                
-                steps_iterable = episode_data['steps']
-                num_steps_tf = tf.data.experimental.cardinality(steps_iterable)
-                num_steps = num_steps_tf.numpy() if num_steps_tf >= 0 else None
-                step_pbar_total = args.max_steps_per_episode if args.max_steps_per_episode else num_steps
-                step_pbar = tqdm(steps_iterable, desc=f"Steps in Ep {episode_id}", total=step_pbar_total, leave=False)
+                episode_pbar.set_postfix_str(f"ID: {ep_id}")
+                ep_output_dir = Path(args.output_dir) / ep_id
+                ep_output_dir.mkdir(parents=True, exist_ok=True)
 
+                # Helper to safely extract nested data from TFDS structures
+                def get_nested_data(data_dict_or_obj, key_string):
+                    keys = key_string.split('.')
+                    current_data = data_dict_or_obj
+                    for key_part in keys:
+                        if isinstance(current_data, dict) and key_part in current_data:
+                            current_data = current_data[key_part]
+                        elif not isinstance(current_data, dict) and hasattr(current_data, key_part): # For object-like structures from TFDS
+                            current_data = getattr(current_data, key_part)
+                        else: return None # Key path not found
+                    return current_data
+
+                # Extract instruction
+                instruction = "Default: No specific instruction provided for episode." # Default if key not found
+                instr_val = get_nested_data(episode_data, args.instruction_key)
+
+                if instr_val is not None:
+                    if isinstance(instr_val, tf.Tensor) and instr_val.dtype == tf.string:
+                        # Handle scalar tensor or first element of 1D array
+                        instruction = instr_val.numpy().decode('utf-8') if instr_val.shape.rank == 0 else (instr_val.numpy()[0].decode('utf-8') if instr_val.shape.rank > 0 and instr_val.shape[0] > 0 else instruction)
+                    elif isinstance(instr_val, (str,bytes)): 
+                        instruction = instr_val.decode('utf-8') if isinstance(instr_val, bytes) else instr_val
+                
+                steps_dataset = episode_data['steps']
+                
+                # Determine number of steps for progress bar more robustly
+                num_steps_avail_tf = tf.data.experimental.cardinality(steps_dataset)
+                num_steps_avail = num_steps_avail_tf.numpy() if num_steps_avail_tf >= 0 else None # -2 for UNKNOWN, -1 for INFINITE
+                
+                steps_to_process_count = args.max_steps_per_episode if args.max_steps_per_episode is not None else num_steps_avail
+                
+                # Apply .take() to limit steps if max_steps_per_episode is set
+                steps_iterable = steps_dataset
+                if args.max_steps_per_episode is not None:
+                    steps_iterable = steps_dataset.take(args.max_steps_per_episode)
+                
+                step_pbar = tqdm(steps_iterable, total=steps_to_process_count, desc=f"Steps in {ep_id}", leave=False)
+                
                 for step_idx, step_data in enumerate(step_pbar):
-                    if args.max_steps_per_episode and step_idx >= args.max_steps_per_episode: break
-                    
                     step_id_str = f"step_{step_idx:04d}"
-                    step_output_dir = episode_output_dir / step_id_str
-                    # step_output_dir.mkdir(parents=True, exist_ok=True) # Parent is already created
-
-                    img_val = step_data
-                    valid_img = True
-                    for key_part in args.image_key.split('.'):
-                        if isinstance(img_val, dict) and key_part in img_val: img_val = img_val[key_part]
-                        elif hasattr(img_val, key_part): img_val = getattr(img_val, key_part)
-                        else: valid_img = False; break
-                    if not valid_img or img_val is None:
-                        # print(f"  [!] Image key '{args.image_key}' not found in step {step_id_str}, ep {episode_id}. Skipping.")
-                        continue
                     
-                    try:
-                        image_pil = Image.fromarray(img_val.numpy()) # TF Tensor to PIL
-                    except Exception as img_err:
-                        # print(f"  [!] Error converting image to PIL for step {step_id_str}: {img_err}. Skipping.")
+                    img_val = get_nested_data(step_data, args.image_key)
+                    if img_val is None: 
+                        print(f"Warning: Image not found for step {step_id_str}, ep {ep_id}. Key: {args.image_key}. Skipping step.")
+                        continue
+                    try: 
+                        image_pil = Image.fromarray(img_val.numpy()) # TFDS usually provides numpy-compatible tensors
+                    except Exception as e_img: 
+                        print(f"Warning: Failed to convert image tensor to PIL for step {step_id_str}, ep {ep_id}: {e_img}. Type: {type(img_val)}. Skipping step.")
                         continue
 
-                    step_instruction = current_instruction # Default to episode
-                    if not args.instruction_key.startswith("episode_metadata"): # Try step-level
-                        step_instr_src = step_data; valid_step_instr = True
-                        for key_part in instr_keys: # Re-use instr_keys for step_data
-                            if isinstance(step_instr_src, dict) and key_part in step_instr_src: step_instr_src = step_instr_src[key_part]
-                            elif hasattr(step_instr_src, key_part): step_instr_src = getattr(step_instr_src, key_part)
-                            else: valid_step_instr = False; break
-                        if valid_step_instr and step_instr_src is not None:
-                            if isinstance(step_instr_src, tf.Tensor) and step_instr_src.dtype == tf.string:
-                                step_instruction = step_instr_src.numpy().decode('utf-8') if step_instr_src.shape.rank == 0 else (step_instr_src.numpy()[0].decode('utf-8') if step_instr_src.shape.rank>0 and step_instr_src.shape[0]>0 else step_instruction)
-                            elif isinstance(step_instr_src, (str, bytes)): step_instruction = step_instr_src.decode('utf-8') if isinstance(step_instr_src, bytes) else step_instr_src
+                    current_step_instruction = instruction # Default to episode/global instruction
+                    if not args.instruction_key.startswith("episode_metadata"): # If key targets step data, try to get it
+                        step_instr_val = get_nested_data(step_data, args.instruction_key)
+                        if step_instr_val is not None:
+                             if isinstance(step_instr_val, tf.Tensor) and step_instr_val.dtype == tf.string:
+                                current_step_instruction = step_instr_val.numpy().decode('utf-8') if step_instr_val.shape.rank == 0 else (step_instr_val.numpy()[0].decode('utf-8') if step_instr_val.shape.rank > 0 and step_instr_val.shape[0]>0 else current_step_instruction)
+                             elif isinstance(step_instr_val, (str,bytes)): 
+                                 current_step_instruction = step_instr_val.decode('utf-8') if isinstance(step_instr_val, bytes) else step_instr_val
 
-                    formatted_prompt = format_prompt_from_instruction(step_instruction, args.model_path)
-                    
-                    step_embeddings = extractor.extract_embeddings(
-                        image_pil=image_pil, prompt=formatted_prompt, token_positions=token_positions_to_extract
-                    )
+                    prompt = format_prompt_from_instruction(current_step_instruction, args.model_path)
+                    step_embs = extractor.extract_embeddings(image_pil, prompt, token_positions_to_extract)
 
-                    action_np = {}
-                    if 'action' in step_data:
-                        for k, v_tensor in step_data['action'].items():
-                            if isinstance(v_tensor, tf.Tensor): action_np[k] = v_tensor.numpy().tolist()
-                            elif isinstance(v_tensor, (int, float, str, bool, list, dict)): action_np[k] = v_tensor
-                    
-                    metadata = {"episode_id": episode_id, "step_index": step_idx, "original_instruction": step_instruction,
+                    if step_embs: # Only save if embeddings were successfully extracted
+                        step_output_dir = ep_output_dir / step_id_str
+                        # step_output_dir.mkdir(parents=True, exist_ok=True) # Parent ep_output_dir already exists
+
+                        action_data = {}
+                        action_val_from_step = get_nested_data(step_data, 'action') # Common key for actions
+                        if isinstance(action_val_from_step, dict):
+                            for k, v_tensor_action in action_val_from_step.items():
+                                if isinstance(v_tensor_action, tf.Tensor): 
+                                    action_data[k] = v_tensor_action.numpy().tolist() # Convert numpy arrays to lists for JSON
+                                elif isinstance(v_tensor_action, (int,float,str,bool,list,dict)): 
+                                    action_data[k] = v_tensor_action # Store as is if simple Python type
+                                # else: print(f"Warning: Action value for key '{k}' is of unhandled type {type(v_tensor_action)}")
+
+                        meta = {"episode_id": ep_id, "step_index": step_idx, "original_instruction": current_step_instruction,
                                 "image_key_used": args.image_key, "instruction_key_used": args.instruction_key,
-                                "layers_extracted": layer_indices_to_hook if layer_indices_to_hook is not None else list(range(extractor.num_layers)),
+                                "layers_extracted": layer_indices_to_hook if args.layers.lower() != "all" else "all", # Store the actual list or "all"
                                 "positions_extracted": token_positions_to_extract,
-                                "embedding_shapes": {k_tuple: list(v.shape) for k_tuple, v in step_embeddings.items()},
-                                "action_from_dataset": action_np}
-                    
-                    if step_embeddings: # Only save if embeddings were extracted
-                         save_embeddings(step_embeddings, step_output_dir, args.format, metadata)
-                         if args.visualize: visualize_embeddings(step_embeddings, step_output_dir)
-                    
+                                "embedding_shapes": {k_tuple:list(v.shape) for k_tuple,v in step_embs.items()}, # k_tuple is (layer_id, stream_name)
+                                "action_from_dataset": action_data }
+                        save_embeddings(step_embs, step_output_dir, args.format, meta) # Pass renamed arg
+                        if args.visualize: visualize_embeddings(step_embs, step_output_dir)
                     total_steps_processed += 1
                 step_pbar.close()
-            except Exception as episode_err:
-                print(f"\nError in episode {i} (ID: {episode_id if 'episode_id' in locals() else 'unknown'}): {episode_err}")
+            except Exception as e_ep: 
+                print(f"\nError processing episode data for ep_idx {ep_idx} (Resolved ID: {ep_id if 'ep_id' in locals() else 'unknown'}): {e_ep}")
                 traceback.print_exc()
+                print(f"Skipping rest of this episode.")
             
         episode_pbar.close()
+        if processed_ep_count < args.num_episodes:
+            print(f"Warning: Processed {processed_ep_count} episodes, but {args.num_episodes} were requested. Dataset might have fewer episodes than requested in the split.")
+
         extractor.clear_hooks()
-
-        print("=" * 80)
-        print(f"Processing Complete. Total Episodes: {args.num_episodes}, Total Steps: {total_steps_processed}.")
-        print(f"Output directory: {Path(args.output_dir).resolve()}")
-        print("=" * 80)
-
-    except Exception as e:
-        print(f"CRITICAL SCRIPT ERROR: {e}")
-        import traceback
+        print("="*80 + f"\nProcessing Complete. Episodes processed: {processed_ep_count}, Total Steps: {total_steps_processed}." + f"\nOutput: {Path(args.output_dir).resolve()}" + "\n" + "="*80)
+    except Exception as e_main: 
+        print(f"CRITICAL SCRIPT ERROR: {e_main}")
         traceback.print_exc()
         sys.exit(1)
 
